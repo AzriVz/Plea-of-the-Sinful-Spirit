@@ -1,0 +1,9 @@
+/build/
+/src/vmlinux.h
+/artifacts/*
+!/artifacts/.gitkeep
+/docs/screenshots/*
+!/docs/screenshots/.gitkeep
+*.o
+*.log
+
