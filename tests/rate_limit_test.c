@@ -84,12 +84,14 @@ int main(int argc, char **argv)
 	raise(SIGSTOP);
 
 	first = run_burst(argv[1], (unsigned int)threshold + 3);
-	printf("WINDOW1 success=%u limited=%u unexpected=%u\n",
-	       first.success, first.limited, first.unexpected);
+	printf("WINDOW1 success=%u rejected=%u errno=%s unexpected=%u\n",
+	       first.success, first.limited,
+	       first.limited ? "11(EAGAIN)" : "none", first.unexpected);
 	clock_nanosleep(CLOCK_MONOTONIC, 0, &next_window, NULL);
 	second = run_burst(argv[1], (unsigned int)threshold);
-	printf("WINDOW2 success=%u limited=%u unexpected=%u\n",
-	       second.success, second.limited, second.unexpected);
+	printf("WINDOW2 success=%u rejected=%u errno=%s unexpected=%u\n",
+	       second.success, second.limited,
+	       second.limited ? "11(EAGAIN)" : "none", second.unexpected);
 	if (first.success == threshold && first.limited == 3 &&
 	    !first.unexpected && second.success == threshold &&
 	    !second.limited && !second.unexpected) {
@@ -99,4 +101,3 @@ int main(int argc, char **argv)
 	printf("FAIL\n");
 	return 1;
 }
-
