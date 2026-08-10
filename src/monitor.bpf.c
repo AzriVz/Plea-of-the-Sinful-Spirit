@@ -98,7 +98,6 @@ int sys_enter(struct trace_event_raw_sys_enter *ctx)
 	struct monitor_event *event;
 	struct cpu_stats *cpu_stats;
 	__u64 pid_tgid;
-	int i;
 
 	cpu_stats = get_stats();
 	if (!cpu_stats)
@@ -116,9 +115,17 @@ int sys_enter(struct trace_event_raw_sys_enter *ctx)
 	if (!event)
 		return 0;
 	event->data.syscall.id = ctx->id;
-#pragma unroll
-	for (i = 0; i < MONITOR_MAX_SYSCALL_ARGS; i++)
-		event->data.syscall.args[i] = ctx->args[i];
+	/*
+	 * Keep every tracepoint-context access at a verifier-known constant
+	 * offset. Clang can turn an unrolled indexed loop into a dereference
+	 * through a modified ctx pointer, which newer verifiers reject.
+	 */
+	event->data.syscall.args[0] = ctx->args[0];
+	event->data.syscall.args[1] = ctx->args[1];
+	event->data.syscall.args[2] = ctx->args[2];
+	event->data.syscall.args[3] = ctx->args[3];
+	event->data.syscall.args[4] = ctx->args[4];
+	event->data.syscall.args[5] = ctx->args[5];
 	bpf_ringbuf_submit(event, 0);
 	return 0;
 }
@@ -163,10 +170,11 @@ int sched_switch(struct trace_event_raw_sched_switch *ctx)
 	event->data.sched.prev_pid = ctx->prev_pid;
 	event->data.sched.next_pid = ctx->next_pid;
 	event->data.sched.prev_state = ctx->prev_state;
-	__builtin_memcpy(event->data.sched.prev_comm, ctx->prev_comm,
-			 sizeof(event->data.sched.prev_comm));
-	__builtin_memcpy(event->data.sched.next_comm, ctx->next_comm,
-			 sizeof(event->data.sched.next_comm));
+	/* Use a helper so LLVM cannot synthesize a directly-dereferenced ctx copy. */
+	bpf_probe_read_kernel(event->data.sched.prev_comm,
+			      sizeof(event->data.sched.prev_comm), ctx->prev_comm);
+	bpf_probe_read_kernel(event->data.sched.next_comm,
+			      sizeof(event->data.sched.next_comm), ctx->next_comm);
 	bpf_ringbuf_submit(event, 0);
 	return 0;
 }
