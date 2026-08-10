@@ -4,7 +4,7 @@ set -euo pipefail
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 artifact_dir="$project_root/artifacts"
 stress_log="$artifact_dir/race_workload.log"
-monitor_log="$artifact_dir/race_monitor.log"
+monitor_log="$artifact_dir/race_test.log"
 workload_pid=""
 monitor_pid=""
 
