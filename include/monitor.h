@@ -27,10 +27,13 @@ struct cpu_stats {
 	__u64 page_fault_count;
 	__u64 rate_limited_count;
 	__u64 ringbuf_dropped_count;
-	__u64 verification_count;
 	__u64 fentry_count;
 	__u64 fexit_count;
 	__u64 sample_sequence;
+};
+
+struct verification_stats {
+	__u64 count;
 };
 
 struct monitor_config {
@@ -43,6 +46,10 @@ struct monitor_config {
 	__u32 rate_limit_tgid;
 	__u32 reserved;
 	__u64 rate_limit_inode;
+	__u64 event_mask;
+	__u32 bonus_target_tgid;
+	__u32 reserved2;
+	char rate_limit_path[MONITOR_PATH_LEN];
 };
 
 struct monitor_event_header {
@@ -110,5 +117,7 @@ struct rate_state {
 
 #define MONITOR_RATE_OPERATION_FILE_OPEN 1U
 #define MONITOR_RATE_WINDOW_NS 1000000000ULL
+#define MONITOR_EVENT_BIT(type) (1ULL << (type))
+#define MONITOR_EVENT_MASK_ALL (~0ULL)
 
 #endif /* PLEA_MONITOR_H */

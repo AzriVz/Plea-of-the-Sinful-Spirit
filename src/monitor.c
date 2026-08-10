@@ -3,6 +3,7 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 
+#include <ctype.h>
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
@@ -32,6 +33,7 @@ struct options {
 	bool no_clear;
 	bool page_faults;
 	bool fentry;
+	__u64 event_mask;
 	const char *rate_limit_path;
 	__u32 rate_limit_threshold;
 	__u32 target_pid;
@@ -42,6 +44,12 @@ struct options {
 };
 
 static volatile sig_atomic_t exiting;
+
+enum rate_enforcement_mode {
+	RATE_ENFORCEMENT_NONE,
+	RATE_ENFORCEMENT_LSM,
+	RATE_ENFORCEMENT_OVERRIDE,
+};
 
 static void handle_signal(int signo)
 {
@@ -68,10 +76,12 @@ static void usage(FILE *stream, const char *program)
 		"      --sample N           emit one of every N events (default: 1000)\n"
 		"      --no-clear           do not clear the terminal between tables\n"
 		"      --page-faults        attach kprobe/handle_mm_fault\n"
+		"      --page-fault-demo    page-fault hook plus filtered detail events\n"
 		"      --fentry             attach fentry/fexit to __x64_sys_openat\n"
+		"      --fentry-demo        fentry/fexit plus filtered detail events\n"
 		"      --rate-limit FILE    enforce per-CPU file-open rate on FILE\n"
 		"      --limit N            successful opens/CPU/second (default: 100)\n"
-		"      --target-pid PID     only rate-limit this test TGID (required)\n"
+		"      --target-pid PID     scope limiter or optional bonus demo TGID\n"
 		"      --test-pid PID       count one syscall for this TGID\n"
 		"      --test-syscall NR    syscall number for --test-pid\n"
 		"      --expect N           compare filtered count at shutdown\n"
@@ -125,7 +135,9 @@ static int parse_options(int argc, char **argv, struct options *opts)
 		OPT_SAMPLE = 1000,
 		OPT_NO_CLEAR,
 		OPT_PAGE_FAULTS,
+		OPT_PAGE_FAULT_DEMO,
 		OPT_FENTRY,
+		OPT_FENTRY_DEMO,
 		OPT_RATE_LIMIT,
 		OPT_LIMIT,
 		OPT_TARGET_PID,
@@ -140,7 +152,9 @@ static int parse_options(int argc, char **argv, struct options *opts)
 		{ "sample", required_argument, NULL, OPT_SAMPLE },
 		{ "no-clear", no_argument, NULL, OPT_NO_CLEAR },
 		{ "page-faults", no_argument, NULL, OPT_PAGE_FAULTS },
+		{ "page-fault-demo", no_argument, NULL, OPT_PAGE_FAULT_DEMO },
 		{ "fentry", no_argument, NULL, OPT_FENTRY },
+		{ "fentry-demo", no_argument, NULL, OPT_FENTRY_DEMO },
 		{ "rate-limit", required_argument, NULL, OPT_RATE_LIMIT },
 		{ "limit", required_argument, NULL, OPT_LIMIT },
 		{ "target-pid", required_argument, NULL, OPT_TARGET_PID },
@@ -161,6 +175,7 @@ static int parse_options(int argc, char **argv, struct options *opts)
 			break;
 		case 'v':
 			opts->events = true;
+			opts->event_mask = MONITOR_EVENT_MASK_ALL;
 			break;
 		case 'h':
 			usage(stdout, argv[0]);
@@ -175,8 +190,19 @@ static int parse_options(int argc, char **argv, struct options *opts)
 		case OPT_PAGE_FAULTS:
 			opts->page_faults = true;
 			break;
+		case OPT_PAGE_FAULT_DEMO:
+			opts->page_faults = true;
+			opts->events = true;
+			opts->event_mask |= MONITOR_EVENT_BIT(MONITOR_EVENT_PAGE_FAULT);
+			break;
 		case OPT_FENTRY:
 			opts->fentry = true;
+			break;
+		case OPT_FENTRY_DEMO:
+			opts->fentry = true;
+			opts->events = true;
+			opts->event_mask |= MONITOR_EVENT_BIT(MONITOR_EVENT_FENTRY) |
+					    MONITOR_EVENT_BIT(MONITOR_EVENT_FEXIT);
 			break;
 		case OPT_RATE_LIMIT:
 			opts->rate_limit_path = optarg;
@@ -252,6 +278,41 @@ static bool kernel_has_bpf_lsm(void)
 	     token = strtok_r(NULL, ",\n", &save)) {
 		if (strcmp(token, "bpf") == 0)
 			return true;
+	}
+	return false;
+}
+
+static bool error_injection_target_available(const char *target)
+{
+	static const char *const list_paths[] = {
+		"/sys/kernel/debug/error_injection/list",
+		/* Compatibility with kernels that expose it below tracefs. */
+		"/sys/kernel/debug/tracing/error_injection/list",
+	};
+	char line[512];
+	size_t target_len = strlen(target);
+	size_t path_index;
+
+	for (path_index = 0; path_index < sizeof(list_paths) / sizeof(list_paths[0]);
+	     path_index++) {
+		FILE *file = fopen(list_paths[path_index], "re");
+
+		if (!file)
+			continue;
+		while (fgets(line, sizeof(line), file)) {
+			char *match = strstr(line, target);
+
+			if (!match)
+				continue;
+			if (match != line && !isspace((unsigned char)match[-1]))
+				continue;
+			if (match[target_len] != '\0' &&
+			    !isspace((unsigned char)match[target_len]))
+				continue;
+			fclose(file);
+			return true;
+		}
+		fclose(file);
 	}
 	return false;
 }
@@ -403,7 +464,7 @@ static int print_event(void *ctx, void *data, size_t size)
 
 static int read_verification_total(int map_fd, int cpu_count, __u64 *total)
 {
-	struct cpu_stats *values;
+	struct verification_stats *values;
 	__u32 key = 0;
 	int cpu;
 
@@ -418,7 +479,7 @@ static int read_verification_total(int map_fd, int cpu_count, __u64 *total)
 	}
 	*total = 0;
 	for (cpu = 0; cpu < cpu_count; cpu++)
-		*total += values[cpu].verification_count;
+		*total += values[cpu].count;
 	free(values);
 	return 0;
 }
@@ -429,6 +490,7 @@ int main(int argc, char **argv)
 		.interval_sec = 1.0,
 		.sample_rate = 1000,
 		.rate_limit_threshold = 100,
+		.event_mask = 0,
 	};
 	struct monitor_bpf *skeleton = NULL;
 	struct ring_buffer *ring = NULL;
@@ -438,10 +500,12 @@ int main(int argc, char **argv)
 	struct utsname uts = {};
 	struct rlimit memlock = { RLIM_INFINITY, RLIM_INFINITY };
 	struct stat rate_target = {};
+	enum rate_enforcement_mode rate_mode = RATE_ENFORCEMENT_NONE;
 	double started;
 	double last_sample;
 	__u32 key = 0;
 	int stats_fd = -1;
+	int verification_fd = -1;
 	int cpu_count;
 	int err;
 	int exit_code = 1;
@@ -454,16 +518,29 @@ int main(int argc, char **argv)
 		return 2;
 	}
 	if (opts.rate_limit_path) {
-		if (!kernel_has_bpf_lsm()) {
-			fprintf(stderr,
-				"Rate limiting unavailable: active LSM list does not contain "
-				"'bpf'. Add bpf to lsm= at boot; no fake tracepoint "
-				"enforcement was attempted.\n");
-			return 3;
-		}
 		if (stat(opts.rate_limit_path, &rate_target)) {
 			fprintf(stderr, "Cannot stat rate-limit target %s: %s\n",
 				opts.rate_limit_path, strerror(errno));
+			return 2;
+		}
+		if (kernel_has_bpf_lsm()) {
+			rate_mode = RATE_ENFORCEMENT_LSM;
+		} else if (error_injection_target_available("__x64_sys_openat")) {
+			rate_mode = RATE_ENFORCEMENT_OVERRIDE;
+		} else {
+			fprintf(stderr,
+				"Rate limiting unavailable: BPF LSM is inactive and "
+				"__x64_sys_openat is not listed as error-injectable (or "
+				"debugfs is unreadable). No observational hook was used "
+				"for fake enforcement.\n");
+			return 3;
+		}
+		if (rate_mode == RATE_ENFORCEMENT_OVERRIDE &&
+		    strlen(opts.rate_limit_path) >= MONITOR_PATH_LEN) {
+			fprintf(stderr,
+				"Rate-limit path is too long for the kprobe fallback "
+				"(maximum %d bytes including NUL)\n",
+				MONITOR_PATH_LEN);
 			return 2;
 		}
 	}
@@ -481,7 +558,9 @@ int main(int argc, char **argv)
 	bpf_program__set_autoload(skeleton->progs.openat_enter, opts.fentry);
 	bpf_program__set_autoload(skeleton->progs.openat_exit, opts.fentry);
 	bpf_program__set_autoload(skeleton->progs.limit_file_open,
-				  opts.rate_limit_path != NULL);
+				  rate_mode == RATE_ENFORCEMENT_LSM);
+	bpf_program__set_autoload(skeleton->progs.limit_openat,
+				  rate_mode == RATE_ENFORCEMENT_OVERRIDE);
 
 	err = monitor_bpf__load(skeleton);
 	if (err) {
@@ -498,6 +577,11 @@ int main(int argc, char **argv)
 	cfg.rate_limit_threshold = opts.rate_limit_threshold;
 	cfg.rate_limit_tgid = opts.target_pid;
 	cfg.rate_limit_inode = rate_target.st_ino;
+	cfg.event_mask = opts.event_mask;
+	cfg.bonus_target_tgid = opts.target_pid;
+	if (opts.rate_limit_path)
+		snprintf(cfg.rate_limit_path, sizeof(cfg.rate_limit_path), "%s",
+			 opts.rate_limit_path);
 	if (bpf_map_update_elem(bpf_map__fd(skeleton->maps.cfg_map), &key, &cfg,
 				BPF_ANY)) {
 		err = -errno;
@@ -522,6 +606,7 @@ int main(int argc, char **argv)
 	}
 
 	stats_fd = bpf_map__fd(skeleton->maps.stats);
+	verification_fd = bpf_map__fd(skeleton->maps.verification);
 	cpu_count = libbpf_num_possible_cpus();
 	if (cpu_count <= 0) {
 		fprintf(stderr, "Failed to determine possible CPU count: %d\n", cpu_count);
@@ -547,10 +632,12 @@ int main(int argc, char **argv)
 	printf("Plea of the Sinful Spirit - eBPF CPU Monitor\n\n");
 	printf("Kernel: %s\nInterval: %.2f sec\nCPUs possible: %d\n",
 	       uts.release, opts.interval_sec, cpu_count);
-	printf("Hooks attached: sys_enter, sys_exit, sched_switch%s%s%s\n",
+	printf("Hooks attached: sys_enter, sys_exit, sched_switch%s%s%s%s\n",
 	       opts.page_faults ? ", handle_mm_fault" : "",
 	       opts.fentry ? ", fentry/fexit openat" : "",
-	       opts.rate_limit_path ? ", LSM file_open" : "");
+	       rate_mode == RATE_ENFORCEMENT_LSM ? ", LSM file_open" : "",
+	       rate_mode == RATE_ENFORCEMENT_OVERRIDE ?
+			", override __x64_sys_openat" : "");
 	if (opts.events)
 		printf("Detailed events: one sample per %u matching hook events\n",
 		       opts.sample_rate);
@@ -589,7 +676,7 @@ int main(int argc, char **argv)
 	if (opts.verification_pid) {
 		__u64 observed = 0;
 
-		err = read_verification_total(stats_fd, cpu_count, &observed);
+		err = read_verification_total(verification_fd, cpu_count, &observed);
 		if (err) {
 			fprintf(stderr, "Failed to read verification counter: %s\n",
 				strerror(-err));

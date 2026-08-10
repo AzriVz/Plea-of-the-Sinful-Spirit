@@ -13,6 +13,14 @@ struct {
 	__type(value, struct cpu_stats);
 } stats SEC(".maps");
 
+/* Isolated from system statistics so deterministic tests cannot be polluted. */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct verification_stats);
+} verification SEC(".maps");
+
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
@@ -48,11 +56,13 @@ static __always_inline const struct monitor_config *get_config(void)
 }
 
 static __always_inline bool should_emit(struct cpu_stats *cpu_stats,
-					const struct monitor_config *cfg)
+					const struct monitor_config *cfg, __u32 type)
 {
 	__u32 rate;
 
 	if (!cfg || !cfg->emit_events)
+		return false;
+	if (!(cfg->event_mask & MONITOR_EVENT_BIT(type)))
 		return false;
 	rate = cfg->sample_rate;
 	if (rate <= 1)
@@ -79,7 +89,7 @@ static __always_inline struct monitor_event *reserve_event(struct cpu_stats *cpu
 {
 	struct monitor_event *event;
 
-	if (!should_emit(cpu_stats, cfg))
+	if (!should_emit(cpu_stats, cfg, type))
 		return NULL;
 	event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
 	if (!event) {
@@ -91,13 +101,82 @@ static __always_inline struct monitor_event *reserve_event(struct cpu_stats *cpu
 	return event;
 }
 
+static __always_inline bool rate_should_reject(const struct monitor_config *cfg,
+					       __u32 tgid, __u32 *current_count)
+{
+	struct rate_state initial = {};
+	struct rate_state *state;
+	struct rate_key key = {
+		.tgid = tgid,
+		.operation = MONITOR_RATE_OPERATION_FILE_OPEN,
+	};
+	__u64 now = bpf_ktime_get_ns();
+
+	state = bpf_map_lookup_elem(&rate_state, &key);
+	if (!state) {
+		initial.window_start_ns = now;
+		initial.count = 1;
+		bpf_map_update_elem(&rate_state, &key, &initial, BPF_NOEXIST);
+		return false;
+	}
+	if (now - state->window_start_ns >= MONITOR_RATE_WINDOW_NS) {
+		state->window_start_ns = now;
+		state->count = 1;
+		return false;
+	}
+	if (state->count < cfg->rate_limit_threshold) {
+		state->count++;
+		return false;
+	}
+	*current_count = state->count;
+	return true;
+}
+
+static __always_inline void record_rate_rejection(const struct monitor_config *cfg,
+						    __u32 current_count)
+{
+	struct rate_limit_event_data *rate_data;
+	struct monitor_event *event;
+	struct cpu_stats *cpu_stats;
+
+	cpu_stats = get_stats();
+	if (!cpu_stats)
+		return;
+	cpu_stats->rate_limited_count++;
+	event = reserve_event(cpu_stats, cfg, MONITOR_EVENT_RATE_LIMIT);
+	if (!event)
+		return;
+	rate_data = &event->data.rate_limit;
+	rate_data->threshold = cfg->rate_limit_threshold;
+	rate_data->count = current_count;
+	rate_data->error = -11;
+	bpf_ringbuf_submit(event, 0);
+}
+
+static __always_inline bool paths_equal(const char left[MONITOR_PATH_LEN],
+					const char right[MONITOR_PATH_LEN])
+{
+	int i;
+
+#pragma unroll
+	for (i = 0; i < MONITOR_PATH_LEN; i++) {
+		if (left[i] != right[i])
+			return false;
+		if (left[i] == '\0')
+			return true;
+	}
+	return false;
+}
+
 SEC("tracepoint/raw_syscalls/sys_enter")
 int sys_enter(struct trace_event_raw_sys_enter *ctx)
 {
 	const struct monitor_config *cfg;
 	struct monitor_event *event;
 	struct cpu_stats *cpu_stats;
+	struct verification_stats *verify;
 	__u64 pid_tgid;
+	__u32 key = 0;
 
 	cpu_stats = get_stats();
 	if (!cpu_stats)
@@ -108,8 +187,11 @@ int sys_enter(struct trace_event_raw_sys_enter *ctx)
 	pid_tgid = bpf_get_current_pid_tgid();
 	if (cfg && cfg->verification_tgid &&
 	    cfg->verification_tgid == (__u32)(pid_tgid >> 32) &&
-	    cfg->verification_syscall == (__u32)ctx->id)
-		cpu_stats->verification_count++;
+	    cfg->verification_syscall == (__u32)ctx->id) {
+		verify = bpf_map_lookup_elem(&verification, &key);
+		if (verify)
+			verify->count++;
+	}
 
 	event = reserve_event(cpu_stats, cfg, MONITOR_EVENT_SYSCALL_ENTER);
 	if (!event)
@@ -192,11 +274,14 @@ int BPF_KPROBE(page_fault, struct vm_area_struct *vma, unsigned long address,
 	(void)vma;
 	(void)flags;
 	(void)regs;
+	cfg = get_config();
+	if (cfg && cfg->bonus_target_tgid &&
+	    cfg->bonus_target_tgid != (__u32)(bpf_get_current_pid_tgid() >> 32))
+		return 0;
 	cpu_stats = get_stats();
 	if (!cpu_stats)
 		return 0;
 	cpu_stats->page_fault_count++;
-	cfg = get_config();
 	event = reserve_event(cpu_stats, cfg, MONITOR_EVENT_PAGE_FAULT);
 	if (!event)
 		return 0;
@@ -217,15 +302,19 @@ int BPF_PROG(openat_enter, const struct pt_regs *regs)
 	long flags;
 
 	(void)ctx;
+	cfg = get_config();
+	if (cfg && cfg->bonus_target_tgid &&
+	    cfg->bonus_target_tgid != (__u32)(bpf_get_current_pid_tgid() >> 32))
+		return 0;
 	cpu_stats = get_stats();
 	if (!cpu_stats)
 		return 0;
 	cpu_stats->fentry_count++;
-	cfg = get_config();
 	event = reserve_event(cpu_stats, cfg, MONITOR_EVENT_FENTRY);
 	if (!event)
 		return 0;
-	dfd = BPF_CORE_READ(regs, di);
+	/* openat(2) defines dfd as int; sign-extend AT_FDCWD (-100). */
+	dfd = (__s32)BPF_CORE_READ(regs, di);
 	filename = (const char *)BPF_CORE_READ(regs, si);
 	flags = BPF_CORE_READ(regs, dx);
 	event->data.tracing.arg0 = dfd;
@@ -245,11 +334,14 @@ int BPF_PROG(openat_exit, const struct pt_regs *regs, long ret)
 
 	(void)ctx;
 	(void)regs;
+	cfg = get_config();
+	if (cfg && cfg->bonus_target_tgid &&
+	    cfg->bonus_target_tgid != (__u32)(bpf_get_current_pid_tgid() >> 32))
+		return 0;
 	cpu_stats = get_stats();
 	if (!cpu_stats)
 		return 0;
 	cpu_stats->fexit_count++;
-	cfg = get_config();
 	event = reserve_event(cpu_stats, cfg, MONITOR_EVENT_FEXIT);
 	if (!event)
 		return 0;
@@ -266,15 +358,9 @@ SEC("lsm/file_open")
 int BPF_PROG(limit_file_open, struct file *file, int ret)
 {
 	const struct monitor_config *cfg;
-	struct rate_state initial = {};
-	struct rate_limit_event_data *rate_data;
-	struct monitor_event *event;
-	struct rate_state *state;
-	struct cpu_stats *cpu_stats;
-	struct rate_key key = {};
 	__u64 pid_tgid;
-	__u64 now;
 	__u64 inode;
+	__u32 current_count = 0;
 
 	(void)ctx;
 	if (ret)
@@ -289,39 +375,44 @@ int BPF_PROG(limit_file_open, struct file *file, int ret)
 	if (inode != cfg->rate_limit_inode)
 		return 0;
 
-	key.tgid = pid_tgid >> 32;
-	key.operation = MONITOR_RATE_OPERATION_FILE_OPEN;
-	now = bpf_ktime_get_ns();
-	state = bpf_map_lookup_elem(&rate_state, &key);
-	if (!state) {
-		initial.window_start_ns = now;
-		initial.count = 1;
-		bpf_map_update_elem(&rate_state, &key, &initial, BPF_NOEXIST);
+	if (!rate_should_reject(cfg, pid_tgid >> 32, &current_count))
 		return 0;
-	}
-	if (now - state->window_start_ns >= MONITOR_RATE_WINDOW_NS) {
-		state->window_start_ns = now;
-		state->count = 1;
-		return 0;
-	}
-	if (state->count < cfg->rate_limit_threshold) {
-		state->count++;
-		return 0;
-	}
-
-	cpu_stats = get_stats();
-	if (!cpu_stats)
-		return -11; /* EAGAIN */
-	cpu_stats->rate_limited_count++;
-	event = reserve_event(cpu_stats, cfg, MONITOR_EVENT_RATE_LIMIT);
-	if (event) {
-		rate_data = &event->data.rate_limit;
-		rate_data->threshold = cfg->rate_limit_threshold;
-		rate_data->count = state->count;
-		rate_data->error = -11;
-		bpf_ringbuf_submit(event, 0);
-	}
+	record_rate_rejection(cfg, current_count);
 	return -11;
+}
+
+/*
+ * Fallback for kernels without active BPF LSM. The loader enables this only
+ * after /sys/kernel/debug/error_injection/list explicitly confirms
+ * __x64_sys_openat is error-injectable.
+ */
+SEC("kprobe/__x64_sys_openat")
+int BPF_KPROBE(limit_openat, const struct pt_regs *regs)
+{
+	char path[MONITOR_PATH_LEN] = {};
+	const struct monitor_config *cfg;
+	const char *filename;
+	__u64 pid_tgid;
+	__u32 current_count = 0;
+	long length;
+
+	cfg = get_config();
+	if (!cfg || !cfg->rate_limit_enabled || !cfg->rate_limit_threshold)
+		return 0;
+	pid_tgid = bpf_get_current_pid_tgid();
+	if ((__u32)(pid_tgid >> 32) != cfg->rate_limit_tgid)
+		return 0;
+	filename = (const char *)BPF_CORE_READ(regs, si);
+	length = bpf_probe_read_user_str(path, sizeof(path), filename);
+	if (length <= 0 || length > MONITOR_PATH_LEN)
+		return 0;
+	if (!paths_equal(path, cfg->rate_limit_path))
+		return 0;
+	if (!rate_should_reject(cfg, pid_tgid >> 32, &current_count))
+		return 0;
+	record_rate_rejection(cfg, current_count);
+	bpf_override_return(ctx, -11); /* EAGAIN, only on the whitelisted target. */
+	return 0;
 }
 
 char LICENSE[] SEC("license") = "GPL";
