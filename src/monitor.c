@@ -73,7 +73,7 @@ static void usage(FILE *stream, const char *program)
 		"\n"
 		"  -i, --interval SEC       refresh interval (default: 1.0)\n"
 		"  -v, --events             print sampled event metadata\n"
-		"      --sample N           emit one of every N events (default: 1000)\n"
+		"      --sample N           emit one of every N events (default: 1)\n"
 		"      --no-clear           do not clear the terminal between tables\n"
 		"      --page-faults        attach kprobe/handle_mm_fault\n"
 		"      --page-fault-demo    page-fault hook plus filtered detail events\n"
@@ -422,8 +422,16 @@ static int print_event(void *ctx, void *data, size_t size)
 		       (uint64_t)event->data.syscall.args[5]);
 		break;
 	case MONITOR_EVENT_SYSCALL_EXIT:
-		printf("sys_exit id=%" PRId64 " ret=%" PRId64,
+		printf("sys_exit id=%" PRId64
+		       " args=[%#" PRIx64 ",%#" PRIx64 ",%#" PRIx64
+		       ",%#" PRIx64 ",%#" PRIx64 ",%#" PRIx64 "] ret=%" PRId64,
 		       (int64_t)event->data.syscall.id,
+		       (uint64_t)event->data.syscall.args[0],
+		       (uint64_t)event->data.syscall.args[1],
+		       (uint64_t)event->data.syscall.args[2],
+		       (uint64_t)event->data.syscall.args[3],
+		       (uint64_t)event->data.syscall.args[4],
+		       (uint64_t)event->data.syscall.args[5],
 		       (int64_t)event->data.syscall.ret);
 		break;
 	case MONITOR_EVENT_SCHED_SWITCH:
@@ -488,7 +496,7 @@ int main(int argc, char **argv)
 {
 	struct options opts = {
 		.interval_sec = 1.0,
-		.sample_rate = 1000,
+		.sample_rate = 1,
 		.rate_limit_threshold = 100,
 		.event_mask = 0,
 	};
@@ -500,6 +508,7 @@ int main(int argc, char **argv)
 	struct utsname uts = {};
 	struct rlimit memlock = { RLIM_INFINITY, RLIM_INFINITY };
 	struct stat rate_target = {};
+	struct stat pid_namespace = {};
 	enum rate_enforcement_mode rate_mode = RATE_ENFORCEMENT_NONE;
 	double started;
 	double last_sample;
@@ -515,6 +524,11 @@ int main(int argc, char **argv)
 		return 0;
 	if (err) {
 		usage(stderr, argv[0]);
+		return 2;
+	}
+	if (stat("/proc/self/ns/pid", &pid_namespace)) {
+		fprintf(stderr, "Cannot inspect current PID namespace: %s\n",
+			strerror(errno));
 		return 2;
 	}
 	if (opts.rate_limit_path) {
@@ -578,6 +592,8 @@ int main(int argc, char **argv)
 	cfg.rate_limit_tgid = opts.target_pid;
 	cfg.rate_limit_inode = rate_target.st_ino;
 	cfg.event_mask = opts.event_mask;
+	cfg.pidns_dev = pid_namespace.st_dev;
+	cfg.pidns_ino = pid_namespace.st_ino;
 	cfg.bonus_target_tgid = opts.target_pid;
 	if (opts.rate_limit_path)
 		snprintf(cfg.rate_limit_path, sizeof(cfg.rate_limit_path), "%s",

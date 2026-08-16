@@ -10,7 +10,8 @@ if [[ $EUID -ne 0 ]]; then
 fi
 make -C "$project_root" all tests >/dev/null
 mkdir -p "$project_root/artifacts"
-"$project_root/build/monitor" --duration 3 --interval 1 --no-clear >"$log" 2>&1 &
+"$project_root/build/monitor" --events --sample 16 --duration 3 \
+	--interval 1 --no-clear >"$log" 2>&1 &
 monitor_pid=$!
 for _ in $(seq 1 100); do
 	grep -q 'Hooks attached:' "$log" 2>/dev/null && break
@@ -37,4 +38,19 @@ if [[ $monitor_status -ne 0 ]]; then
 	exit 1
 fi
 grep -q '^TOTAL' "$log"
-echo "PASS: mandatory hooks produced live per-CPU rates. Evidence: $log"
+if ! grep -Eq '^EVENT ts=[0-9]+ cpu=[0-9]+ pid=[0-9]+ tgid=[0-9]+ comm=.* sys_enter id=-?[0-9]+ args=\[[^]]+\]$' \
+	"$log"; then
+	echo "FAIL: no complete syscall-entry event was captured" >&2
+	exit 1
+fi
+if ! grep -Eq '^EVENT ts=[0-9]+ cpu=[0-9]+ pid=[0-9]+ tgid=[0-9]+ comm=.* sys_exit id=-?[0-9]+ args=\[[^]]+\] ret=-?[0-9]+$' \
+	"$log"; then
+	echo "FAIL: no correlated syscall-exit event was captured" >&2
+	exit 1
+fi
+if ! grep -Eq '^EVENT ts=[0-9]+ cpu=[0-9]+ pid=[0-9]+ tgid=[0-9]+ comm=.* sched_switch prev=' \
+	"$log"; then
+	echo "FAIL: no complete sched-switch event was captured" >&2
+	exit 1
+fi
+echo "PASS: mandatory hooks produced complete events and live per-CPU rates. Evidence: $log"

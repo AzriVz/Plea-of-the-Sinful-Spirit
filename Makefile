@@ -14,20 +14,21 @@ TEST_BINS := $(BUILD_DIR)/syscall_stress $(BUILD_DIR)/rate_limit_test \
 
 BPF_CFLAGS := -g -O2 -target bpf -D__TARGET_ARCH_x86 -Wall -Wextra \
 	-Wno-missing-declarations \
-	-I$(CURDIR)/src -I$(CURDIR)/include
-USER_CFLAGS := -g -O2 -Wall -Wextra -std=gnu11 -I$(CURDIR)/include \
-	-I$(CURDIR)/$(BUILD_DIR) $(shell $(PKG_CONFIG) --cflags libbpf)
+	-Isrc -Iinclude
+USER_CFLAGS := -g -O2 -Wall -Wextra -std=gnu11 -Iinclude \
+	-I$(BUILD_DIR) $(shell $(PKG_CONFIG) --cflags libbpf)
 USER_LIBS := $(shell $(PKG_CONFIG) --libs libbpf) -lelf -lz
 
 .PHONY: all clean distclean vmlinux tests verifier-test bonus-tests \
-	test-page-fault test-rate-limit test-race test-fentry help
+	test-monitor test-page-fault test-rate-limit test-race test-fentry help
 .DELETE_ON_ERROR:
 
 all: $(MONITOR)
 
 help:
-	@echo "Targets: all vmlinux tests verifier-test bonus-tests test-page-fault"
-	@echo "         test-rate-limit test-race test-fentry clean distclean"
+	@echo "Targets: all vmlinux tests verifier-test bonus-tests test-monitor"
+	@echo "         test-page-fault test-rate-limit test-race test-fentry"
+	@echo "         clean distclean"
 
 $(BUILD_DIR):
 	mkdir -p $@
@@ -72,6 +73,9 @@ tests: $(TEST_BINS)
 
 verifier-test: all $(INVALID_OBJECT)
 	./scripts/test_verifier.sh
+
+test-monitor: all tests
+	./scripts/test_monitor.sh
 
 test-page-fault: all tests
 	./scripts/test_page_fault.sh

@@ -24,7 +24,6 @@ mkdir -p "$artifact_dir"
 
 "$project_root/build/page_fault_test" --pause 32768 >"$workload_log" 2>&1 &
 workload_pid=$!
-target_tgid=$workload_pid
 for _ in $(seq 1 200); do
 	state=$(awk '/^State:/ {print $2}' "/proc/$workload_pid/status" 2>/dev/null || true)
 	[[ $state == T ]] && break
@@ -33,6 +32,10 @@ done
 if [[ ${state:-} != T ]]; then
 	echo "FAIL: page-fault workload did not reach its SIGSTOP point" >&2
 	exit 1
+fi
+target_tgid=$(awk '/^NSpid:/ {print $2; exit}' "/proc/$workload_pid/status")
+if [[ -z $target_tgid ]]; then
+	target_tgid=$workload_pid
 fi
 
 "$project_root/build/monitor" --page-fault-demo --sample 64 --no-clear \

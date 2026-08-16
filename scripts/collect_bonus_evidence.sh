@@ -30,8 +30,12 @@ make -C "$project_root" all tests >/dev/null || exit 1
 	clang --version
 	ls -lh /sys/kernel/btf/vmlinux
 	printf 'Active LSMs: '
-	cat /sys/kernel/security/lsm
-	echo
+	if [[ -r /sys/kernel/security/lsm ]]; then
+		cat /sys/kernel/security/lsm
+		echo
+	else
+		echo "unavailable (securityfs is absent or unreadable)"
+	fi
 	echo "BTF targets:"
 	bpftool btf dump file /sys/kernel/btf/vmlinux format raw |
 		grep -E "FUNC '(handle_mm_fault|__x64_sys_openat)'"
@@ -90,6 +94,8 @@ done
 if grep -q 'Hooks attached:' "$artifact_dir/bonus_inventory_monitor.log"; then
 	bpftool prog list >"$artifact_dir/bpftool_prog_list.log" 2>&1
 	bpftool map list >"$artifact_dir/bpftool_map_list.log" 2>&1
+	bpftool map dump name stats >"$artifact_dir/bpftool_map_dump_stats.log" 2>&1
+	bpftool map dump name cfg_map >"$artifact_dir/bpftool_map_dump_config.log" 2>&1
 	kill -INT "$inventory_pid" 2>/dev/null || true
 	wait "$inventory_pid" 2>/dev/null || true
 	inventory_pid=""

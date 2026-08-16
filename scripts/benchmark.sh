@@ -9,6 +9,11 @@ if ! command -v perf >/dev/null 2>&1; then
 	echo "perf is missing. On Ubuntu install the matching linux-tools package." >&2
 	exit 77
 fi
+if ! perf version >/dev/null 2>&1; then
+	echo "The perf wrapper exists, but tools for kernel $(uname -r) are missing." >&2
+	echo "Install the matching linux-tools package before collecting benchmark evidence." >&2
+	exit 77
+fi
 if [[ $EUID -ne 0 ]]; then
 	echo "Run both comparable modes with: sudo ./scripts/benchmark.sh" >&2
 	exit 77
@@ -40,4 +45,3 @@ kill -INT "$monitor_pid"
 wait "$monitor_pid"
 trap - EXIT
 echo "Actual measurements saved under $artifact_dir (no values were synthesized)."
-

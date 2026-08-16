@@ -9,6 +9,7 @@ monitor_log="$artifact_dir/rate_limit_monitor.log"
 demo_log="$artifact_dir/rate_limit_demo.log"
 program_log="$artifact_dir/rate_limit_bpftool_prog_list.log"
 map_log="$artifact_dir/rate_limit_bpftool_map_list.log"
+map_dump_log="$artifact_dir/rate_limit_bpftool_map_dump.log"
 threshold=10
 workload_pid=""
 monitor_pid=""
@@ -28,7 +29,8 @@ mkdir -p "$artifact_dir"
 lsm_available=false
 override_available=false
 override_status="target-absent"
-if tr ',' '\n' </sys/kernel/security/lsm | grep -qx bpf; then
+lsm_file=/sys/kernel/security/lsm
+if [[ -r $lsm_file ]] && tr ',' '\n' <"$lsm_file" | grep -qx bpf; then
 	lsm_available=true
 fi
 error_injection_list=""
@@ -51,8 +53,12 @@ if [[ $lsm_available == false && $override_available == false ]]; then
 	{
 		echo "SKIP: no supported kernel enforcement hook is available."
 		printf 'Active LSMs: '
-		cat /sys/kernel/security/lsm
-		echo
+		if [[ -r $lsm_file ]]; then
+			cat "$lsm_file"
+			echo
+		else
+			echo "unavailable ($lsm_file is absent or unreadable)"
+		fi
 		printf 'BPF LSM active: %s\n' "$lsm_available"
 		printf '__x64_sys_openat error-injectable: %s\n' "$override_available"
 		printf 'Error-injection capability: %s\n' "$override_status"
@@ -96,6 +102,7 @@ bpftool map list >"$map_log" 2>&1
 kill -CONT "$workload_pid"
 wait "$workload_pid"
 workload_pid=""
+bpftool map dump name rate_state >"$map_dump_log" 2>&1
 kill -INT "$monitor_pid"
 wait "$monitor_pid"
 monitor_pid=""
@@ -113,5 +120,8 @@ cat "$workload_log"
 	echo
 	echo "Loaded maps while enforcement was attached:"
 	cat "$map_log"
+	echo
+	echo "Per-CPU rate-state map after the workload:"
+	cat "$map_dump_log"
 } >"$demo_log"
 echo "Evidence: $demo_log"

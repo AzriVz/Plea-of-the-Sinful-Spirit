@@ -47,6 +47,8 @@ struct monitor_config {
 	__u32 reserved;
 	__u64 rate_limit_inode;
 	__u64 event_mask;
+	__u64 pidns_dev;
+	__u64 pidns_ino;
 	__u32 bonus_target_tgid;
 	__u32 reserved2;
 	char rate_limit_path[MONITOR_PATH_LEN];
@@ -65,6 +67,12 @@ struct syscall_event_data {
 	__s64 id;
 	__u64 args[MONITOR_MAX_SYSCALL_ARGS];
 	__s64 ret;
+};
+
+/* Temporary entry-side state used to enrich the matching syscall-exit event. */
+struct syscall_snapshot {
+	__s64 id;
+	__u64 args[MONITOR_MAX_SYSCALL_ARGS];
 };
 
 struct sched_event_data {

@@ -41,6 +41,17 @@ struct {
 	__type(value, struct rate_state);
 } rate_state SEC(".maps");
 
+/*
+ * Correlation only, not aggregation. A normal LRU hash is required because a
+ * task can enter on one CPU and exit after migrating to another CPU.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 32768);
+	__type(key, __u32); /* kernel thread ID */
+	__type(value, struct syscall_snapshot);
+} active_syscalls SEC(".maps");
+
 static __always_inline struct cpu_stats *get_stats(void)
 {
 	__u32 key = 0;
@@ -53,6 +64,19 @@ static __always_inline const struct monitor_config *get_config(void)
 	__u32 key = 0;
 
 	return bpf_map_lookup_elem(&cfg_map, &key);
+}
+
+static __always_inline __u32 current_tgid_in_configured_ns(
+	const struct monitor_config *cfg)
+{
+	struct bpf_pidns_info ns = {};
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+
+	if (cfg && cfg->pidns_ino &&
+	    bpf_get_ns_current_pid_tgid(cfg->pidns_dev, cfg->pidns_ino, &ns,
+					sizeof(ns)) == 0 && ns.tgid)
+		return ns.tgid;
+	return pid_tgid >> 32;
 }
 
 static __always_inline bool should_emit(struct cpu_stats *cpu_stats,
@@ -71,8 +95,10 @@ static __always_inline bool should_emit(struct cpu_stats *cpu_stats,
 	return cpu_stats->sample_sequence % rate == 0;
 }
 
-static __always_inline void fill_header(struct monitor_event_header *header, __u32 type)
+static __always_inline void fill_header(struct monitor_event_header *header,
+					const struct monitor_config *cfg, __u32 type)
 {
+	struct bpf_pidns_info ns = {};
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 
 	header->timestamp_ns = bpf_ktime_get_ns();
@@ -80,6 +106,12 @@ static __always_inline void fill_header(struct monitor_event_header *header, __u
 	header->tgid = pid_tgid >> 32;
 	header->cpu = bpf_get_smp_processor_id();
 	header->event_type = type;
+	if (cfg && cfg->pidns_ino &&
+	    bpf_get_ns_current_pid_tgid(cfg->pidns_dev, cfg->pidns_ino, &ns,
+					sizeof(ns)) == 0 && ns.tgid) {
+		header->pid = ns.pid;
+		header->tgid = ns.tgid;
+	}
 	bpf_get_current_comm(header->comm, sizeof(header->comm));
 }
 
@@ -97,7 +129,7 @@ static __always_inline struct monitor_event *reserve_event(struct cpu_stats *cpu
 		return NULL;
 	}
 	__builtin_memset(event, 0, sizeof(*event));
-	fill_header(&event->header, type);
+	fill_header(&event->header, cfg, type);
 	return event;
 }
 
@@ -175,7 +207,9 @@ int sys_enter(struct trace_event_raw_sys_enter *ctx)
 	struct monitor_event *event;
 	struct cpu_stats *cpu_stats;
 	struct verification_stats *verify;
+	struct syscall_snapshot snapshot = {};
 	__u64 pid_tgid;
+	__u32 tid;
 	__u32 key = 0;
 
 	cpu_stats = get_stats();
@@ -185,29 +219,41 @@ int sys_enter(struct trace_event_raw_sys_enter *ctx)
 
 	cfg = get_config();
 	pid_tgid = bpf_get_current_pid_tgid();
+	tid = (__u32)pid_tgid;
 	if (cfg && cfg->verification_tgid &&
-	    cfg->verification_tgid == (__u32)(pid_tgid >> 32) &&
+	    cfg->verification_tgid == current_tgid_in_configured_ns(cfg) &&
 	    cfg->verification_syscall == (__u32)ctx->id) {
 		verify = bpf_map_lookup_elem(&verification, &key);
 		if (verify)
 			verify->count++;
 	}
 
+	if (cfg && cfg->emit_events &&
+	    (cfg->event_mask &
+	     (MONITOR_EVENT_BIT(MONITOR_EVENT_SYSCALL_ENTER) |
+	      MONITOR_EVENT_BIT(MONITOR_EVENT_SYSCALL_EXIT)))) {
+		snapshot.id = ctx->id;
+		/* Keep tracepoint-context accesses at verifier-known constant offsets. */
+		snapshot.args[0] = ctx->args[0];
+		snapshot.args[1] = ctx->args[1];
+		snapshot.args[2] = ctx->args[2];
+		snapshot.args[3] = ctx->args[3];
+		snapshot.args[4] = ctx->args[4];
+		snapshot.args[5] = ctx->args[5];
+		if (cfg->event_mask & MONITOR_EVENT_BIT(MONITOR_EVENT_SYSCALL_EXIT))
+			bpf_map_update_elem(&active_syscalls, &tid, &snapshot, BPF_ANY);
+	}
+
 	event = reserve_event(cpu_stats, cfg, MONITOR_EVENT_SYSCALL_ENTER);
 	if (!event)
 		return 0;
-	event->data.syscall.id = ctx->id;
-	/*
-	 * Keep every tracepoint-context access at a verifier-known constant
-	 * offset. Clang can turn an unrolled indexed loop into a dereference
-	 * through a modified ctx pointer, which newer verifiers reject.
-	 */
-	event->data.syscall.args[0] = ctx->args[0];
-	event->data.syscall.args[1] = ctx->args[1];
-	event->data.syscall.args[2] = ctx->args[2];
-	event->data.syscall.args[3] = ctx->args[3];
-	event->data.syscall.args[4] = ctx->args[4];
-	event->data.syscall.args[5] = ctx->args[5];
+	event->data.syscall.id = snapshot.id;
+	event->data.syscall.args[0] = snapshot.args[0];
+	event->data.syscall.args[1] = snapshot.args[1];
+	event->data.syscall.args[2] = snapshot.args[2];
+	event->data.syscall.args[3] = snapshot.args[3];
+	event->data.syscall.args[4] = snapshot.args[4];
+	event->data.syscall.args[5] = snapshot.args[5];
 	bpf_ringbuf_submit(event, 0);
 	return 0;
 }
@@ -218,18 +264,34 @@ int sys_exit(struct trace_event_raw_sys_exit *ctx)
 	const struct monitor_config *cfg;
 	struct monitor_event *event;
 	struct cpu_stats *cpu_stats;
+	struct syscall_snapshot *snapshot;
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 
 	cpu_stats = get_stats();
 	if (!cpu_stats)
 		return 0;
 	cpu_stats->syscall_exit_count++;
 	cfg = get_config();
+	snapshot = bpf_map_lookup_elem(&active_syscalls, &tid);
 	event = reserve_event(cpu_stats, cfg, MONITOR_EVENT_SYSCALL_EXIT);
-	if (!event)
+	if (!event) {
+		if (snapshot)
+			bpf_map_delete_elem(&active_syscalls, &tid);
 		return 0;
+	}
 	/* This kernel's BTF tracepoint context exposes id directly, so no stale map. */
 	event->data.syscall.id = ctx->id;
 	event->data.syscall.ret = ctx->ret;
+	if (snapshot && snapshot->id == ctx->id) {
+		event->data.syscall.args[0] = snapshot->args[0];
+		event->data.syscall.args[1] = snapshot->args[1];
+		event->data.syscall.args[2] = snapshot->args[2];
+		event->data.syscall.args[3] = snapshot->args[3];
+		event->data.syscall.args[4] = snapshot->args[4];
+		event->data.syscall.args[5] = snapshot->args[5];
+	}
+	if (snapshot)
+		bpf_map_delete_elem(&active_syscalls, &tid);
 	bpf_ringbuf_submit(event, 0);
 	return 0;
 }
@@ -261,7 +323,7 @@ int sched_switch(struct trace_event_raw_sched_switch *ctx)
 	return 0;
 }
 
-/* BTF ID 121855 on the inspected kernel: the address is the second argument. */
+/* The BTF signature of handle_mm_fault exposes the fault address as arg #2. */
 SEC("kprobe/handle_mm_fault")
 int BPF_KPROBE(page_fault, struct vm_area_struct *vma, unsigned long address,
 	       unsigned int flags, struct pt_regs *regs)
@@ -276,7 +338,7 @@ int BPF_KPROBE(page_fault, struct vm_area_struct *vma, unsigned long address,
 	(void)regs;
 	cfg = get_config();
 	if (cfg && cfg->bonus_target_tgid &&
-	    cfg->bonus_target_tgid != (__u32)(bpf_get_current_pid_tgid() >> 32))
+	    cfg->bonus_target_tgid != current_tgid_in_configured_ns(cfg))
 		return 0;
 	cpu_stats = get_stats();
 	if (!cpu_stats)
@@ -304,7 +366,7 @@ int BPF_PROG(openat_enter, const struct pt_regs *regs)
 	(void)ctx;
 	cfg = get_config();
 	if (cfg && cfg->bonus_target_tgid &&
-	    cfg->bonus_target_tgid != (__u32)(bpf_get_current_pid_tgid() >> 32))
+	    cfg->bonus_target_tgid != current_tgid_in_configured_ns(cfg))
 		return 0;
 	cpu_stats = get_stats();
 	if (!cpu_stats)
@@ -336,7 +398,7 @@ int BPF_PROG(openat_exit, const struct pt_regs *regs, long ret)
 	(void)regs;
 	cfg = get_config();
 	if (cfg && cfg->bonus_target_tgid &&
-	    cfg->bonus_target_tgid != (__u32)(bpf_get_current_pid_tgid() >> 32))
+	    cfg->bonus_target_tgid != current_tgid_in_configured_ns(cfg))
 		return 0;
 	cpu_stats = get_stats();
 	if (!cpu_stats)
@@ -358,9 +420,9 @@ SEC("lsm/file_open")
 int BPF_PROG(limit_file_open, struct file *file, int ret)
 {
 	const struct monitor_config *cfg;
-	__u64 pid_tgid;
 	__u64 inode;
 	__u32 current_count = 0;
+	__u32 current_tgid;
 
 	(void)ctx;
 	if (ret)
@@ -368,14 +430,14 @@ int BPF_PROG(limit_file_open, struct file *file, int ret)
 	cfg = get_config();
 	if (!cfg || !cfg->rate_limit_enabled || !cfg->rate_limit_threshold)
 		return 0;
-	pid_tgid = bpf_get_current_pid_tgid();
-	if ((__u32)(pid_tgid >> 32) != cfg->rate_limit_tgid)
+	current_tgid = current_tgid_in_configured_ns(cfg);
+	if (current_tgid != cfg->rate_limit_tgid)
 		return 0;
 	inode = BPF_CORE_READ(file, f_inode, i_ino);
 	if (inode != cfg->rate_limit_inode)
 		return 0;
 
-	if (!rate_should_reject(cfg, pid_tgid >> 32, &current_count))
+	if (!rate_should_reject(cfg, current_tgid, &current_count))
 		return 0;
 	record_rate_rejection(cfg, current_count);
 	return -11;
@@ -392,15 +454,15 @@ int BPF_KPROBE(limit_openat, const struct pt_regs *regs)
 	char path[MONITOR_PATH_LEN] = {};
 	const struct monitor_config *cfg;
 	const char *filename;
-	__u64 pid_tgid;
 	__u32 current_count = 0;
+	__u32 current_tgid;
 	long length;
 
 	cfg = get_config();
 	if (!cfg || !cfg->rate_limit_enabled || !cfg->rate_limit_threshold)
 		return 0;
-	pid_tgid = bpf_get_current_pid_tgid();
-	if ((__u32)(pid_tgid >> 32) != cfg->rate_limit_tgid)
+	current_tgid = current_tgid_in_configured_ns(cfg);
+	if (current_tgid != cfg->rate_limit_tgid)
 		return 0;
 	filename = (const char *)BPF_CORE_READ(regs, si);
 	length = bpf_probe_read_user_str(path, sizeof(path), filename);
@@ -408,7 +470,7 @@ int BPF_KPROBE(limit_openat, const struct pt_regs *regs)
 		return 0;
 	if (!paths_equal(path, cfg->rate_limit_path))
 		return 0;
-	if (!rate_should_reject(cfg, pid_tgid >> 32, &current_count))
+	if (!rate_should_reject(cfg, current_tgid, &current_count))
 		return 0;
 	record_rate_rejection(cfg, current_count);
 	bpf_override_return(ctx, -11); /* EAGAIN, only on the whitelisted target. */

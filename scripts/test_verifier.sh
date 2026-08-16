@@ -5,15 +5,14 @@ project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 artifact_dir="$project_root/artifacts"
 invalid_log="$artifact_dir/verifier_reject.log"
 accept_log="$artifact_dir/verifier_accept.log"
-pin_path="/sys/fs/bpf/plea_invalid_$$"
+pin_path="/tmp/plea_invalid_$$"
 
 if [[ $EUID -ne 0 ]]; then
 	echo "Verifier loading requires privilege. Run: sudo make verifier-test" >&2
 	exit 77
 fi
-if ! mountpoint -q /sys/fs/bpf; then
-	echo "/sys/fs/bpf is not mounted; mount bpffs before running this test." >&2
-	exit 1
+if mountpoint -q /sys/fs/bpf; then
+	pin_path="/sys/fs/bpf/plea_invalid_$$"
 fi
 
 mkdir -p "$artifact_dir"
@@ -48,4 +47,3 @@ if ! grep -q 'Hooks attached: sys_enter, sys_exit, sched_switch' "$accept_log"; 
 	exit 1
 fi
 echo "PASS: valid monitor loaded, attached, sampled, and detached ($accept_log)"
-
