@@ -4,14 +4,33 @@ set -euo pipefail
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 artifact_dir="$project_root/artifacts"
 monitor_log="$artifact_dir/benchmark_monitor.log"
+perf_bin="${PERF_BIN:-}"
 
-if ! command -v perf >/dev/null 2>&1; then
-	echo "perf is missing. On Ubuntu install the matching linux-tools package." >&2
-	exit 77
+if [[ -n "$perf_bin" ]]; then
+	if [[ ! -x "$perf_bin" ]] || ! "$perf_bin" version >/dev/null 2>&1; then
+		echo "PERF_BIN does not point to a working perf executable: $perf_bin" >&2
+		exit 77
+	fi
+elif command -v perf >/dev/null 2>&1 && perf version >/dev/null 2>&1; then
+	perf_bin=$(command -v perf)
+else
+	# Ubuntu's /usr/bin/perf wrapper requires an exact kernel package.  WSL2
+	# uses a Microsoft kernel name, but an installed generic perf binary can
+	# still provide perf stat. Prefer the newest available binary.
+	mapfile -t perf_candidates < <(
+		find /usr/lib/linux-tools -mindepth 2 -maxdepth 2 -name perf \
+			-print 2>/dev/null | sort -Vr
+	)
+	for candidate in "${perf_candidates[@]}"; do
+		if [[ -x "$candidate" ]] && "$candidate" version >/dev/null 2>&1; then
+			perf_bin=$candidate
+			break
+		fi
+	done
 fi
-if ! perf version >/dev/null 2>&1; then
-	echo "The perf wrapper exists, but tools for kernel $(uname -r) are missing." >&2
-	echo "Install the matching linux-tools package before collecting benchmark evidence." >&2
+if [[ -z "$perf_bin" ]]; then
+	echo "No working perf executable was found for kernel $(uname -r)." >&2
+	echo "Install linux-tools-generic or set PERF_BIN to a working perf binary." >&2
 	exit 77
 fi
 if [[ $EUID -ne 0 ]]; then
@@ -21,8 +40,9 @@ fi
 mkdir -p "$artifact_dir"
 make -C "$project_root" all tests >/dev/null
 
+echo "Using perf: $perf_bin ($("$perf_bin" version))"
 echo "Benchmarking baseline..."
-perf stat -o "$artifact_dir/benchmark_baseline.txt" \
+"$perf_bin" stat -o "$artifact_dir/benchmark_baseline.txt" \
 	-- "$project_root/build/syscall_stress" --iterations 1000000 \
 	>"$artifact_dir/benchmark_baseline_workload.txt"
 
@@ -38,7 +58,7 @@ for _ in $(seq 1 200); do
 	fi
 	sleep 0.05
 done
-perf stat -o "$artifact_dir/benchmark_monitor_loaded.txt" \
+"$perf_bin" stat -o "$artifact_dir/benchmark_monitor_loaded.txt" \
 	-- "$project_root/build/syscall_stress" --iterations 1000000 \
 	>"$artifact_dir/benchmark_monitor_workload.txt"
 kill -INT "$monitor_pid"
