@@ -53,7 +53,7 @@ $(MONITOR): src/monitor.c include/monitor.h $(SKELETON) | $(BUILD_DIR)
 	@echo "  CC      $@"
 	$(CC) $(USER_CFLAGS) $< -o $@ $(USER_LIBS)
 
-$(INVALID_OBJECT): verifier_tests/invalid_memory.bpf.c $(VMLINUX) | $(BUILD_DIR)
+$(INVALID_OBJECT): verifier/invalid_memory.bpf.c $(VMLINUX) | $(BUILD_DIR)
 	@echo "  BPF     $@ (intentionally invalid at load time)"
 	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
 
